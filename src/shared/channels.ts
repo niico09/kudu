@@ -228,6 +228,7 @@ export const IPC = {
   // Software Updater
   SOFTWARE_UPDATE_CHECK: 'software-update:check',
   SOFTWARE_UPDATE_RUN: 'software-update:run',
+  SOFTWARE_UPDATE_INSTALL_MANAGER: 'software-update:install-manager',
   SOFTWARE_UPDATE_PROGRESS: 'software-update:progress',
 
   // Cloud Agent

@@ -1105,6 +1105,19 @@ export interface PackageManagerStatus {
    * succeeded (even if nothing was outdated).
    */
   error?: string
+  /**
+   * Present only when the manager is missing and Kudu knows how to install it:
+   * the vendor's bootstrap command, for the UI to offer (and show) to the user.
+   */
+  installCommand?: string
+}
+
+/** Outcome of Kudu installing a package manager it could not find. */
+export interface ManagerInstallOutcome {
+  success: boolean
+  /** What Kudu ran, or — when it could not — what the user has to run instead. */
+  command: string
+  error?: string
 }
 
 /** A single package to update, tagged with the manager that owns it. */
@@ -1169,8 +1182,19 @@ export interface UpdateResult {
    * Failed packages. `source` is set on Windows aggregation so a failure can be
    * matched to the exact package when the same id exists under two managers
    * (e.g. choco + scoop "git"); it is omitted on single-manager platforms.
+   *
+   * `suggestedCommands` carries the commands a user can run themselves when the
+   * automated upgrade cannot succeed (winget refuses some upgrades by design —
+   * see `wingetRemedies` in software-updater.ts). Absent when there is nothing
+   * useful to suggest.
    */
-  errors: { appId: string; name: string; reason: string; source?: string }[]
+  errors: {
+    appId: string
+    name: string
+    reason: string
+    source?: string
+    suggestedCommands?: string[]
+  }[]
 }
 
 // ─── Disk Repair ───────────────────────────────────────────

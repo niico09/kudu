@@ -16,17 +16,32 @@ vi.mock('../../shared/channels', () => ({
   IPC: {
     SOFTWARE_UPDATE_CHECK: 'software-update:check',
     SOFTWARE_UPDATE_RUN: 'software-update:run',
+    SOFTWARE_UPDATE_INSTALL_MANAGER: 'software-update:install-manager',
     SOFTWARE_UPDATE_PROGRESS: 'software-update:progress'
   }
 }))
 
 const mockCheckForUpdates = vi.fn()
 const mockRunUpdates = vi.fn()
+const mockInstallPackageManager = vi.fn()
 
 vi.mock('../services/software-updater', () => ({
   checkForUpdates: (...args: unknown[]) => mockCheckForUpdates(...args),
   runUpdates: (...args: unknown[]) => mockRunUpdates(...args)
 }))
+
+// Only the install itself is faked: the allow-list that guards it stays real,
+// because that check is the boundary between a renderer-supplied name and a
+// shell.
+vi.mock('../services/package-manager-install', async () => {
+  const actual = await vi.importActual<typeof import('../services/package-manager-install')>(
+    '../services/package-manager-install'
+  )
+  return {
+    ...actual,
+    installPackageManager: (...args: unknown[]) => mockInstallPackageManager(...args)
+  }
+})
 
 import { registerSoftwareUpdaterIpc } from './software-updater.ipc'
 import type { BrowserWindow } from 'electron'
@@ -54,11 +69,12 @@ describe('software-updater IPC', () => {
     vi.clearAllMocks()
   })
 
-  it('registers both IPC handlers', () => {
+  it('registers every IPC handler', () => {
     const win = makeWindow()
     registerSoftwareUpdaterIpc(() => win)
     expect(handleMap.has('software-update:check')).toBe(true)
     expect(handleMap.has('software-update:run')).toBe(true)
+    expect(handleMap.has('software-update:install-manager')).toBe(true)
   })
 
   // ── SOFTWARE_UPDATE_CHECK ──────────────────────────────────
@@ -242,6 +258,54 @@ describe('software-updater IPC', () => {
 
       registerSoftwareUpdaterIpc(() => makeWindow())
       await expect(invoke('software-update:run', [item('app1')])).rejects.toThrow('update failed')
+    })
+  })
+
+  // ── SOFTWARE_UPDATE_INSTALL_MANAGER ────────────────────────
+
+  describe('SOFTWARE_UPDATE_INSTALL_MANAGER', () => {
+    it('installs an allow-listed manager and returns the outcome', async () => {
+      const outcome = { success: true, command: 'irm get.scoop.sh | iex' }
+      mockInstallPackageManager.mockResolvedValue(outcome)
+
+      registerSoftwareUpdaterIpc(() => makeWindow())
+      const result = await invoke('software-update:install-manager', 'scoop')
+
+      expect(result).toEqual(outcome)
+      expect(mockInstallPackageManager).toHaveBeenCalledWith('scoop')
+    })
+
+    it('refuses names outside the allow-list without touching the service', async () => {
+      registerSoftwareUpdaterIpc(() => makeWindow())
+
+      for (const value of [
+        'winget',
+        'npm',
+        '',
+        'choco; Remove-Item -Recurse -Force C:\\',
+        'choco ',
+        'constructor',
+        42,
+        null,
+        { toString: () => 'choco' }
+      ]) {
+        const result = await invoke('software-update:install-manager', value)
+        expect(result).toEqual({
+          success: false,
+          command: '',
+          error: 'Unsupported package manager'
+        })
+      }
+      expect(mockInstallPackageManager).not.toHaveBeenCalled()
+    })
+
+    it('propagates errors from the installer', async () => {
+      mockInstallPackageManager.mockRejectedValue(new Error('the user declined UAC'))
+
+      registerSoftwareUpdaterIpc(() => makeWindow())
+      await expect(invoke('software-update:install-manager', 'choco')).rejects.toThrow(
+        'the user declined UAC'
+      )
     })
   })
 })

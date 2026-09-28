@@ -1,9 +1,14 @@
 import { ipcMain } from 'electron'
 import { IPC } from '../../shared/channels'
 import { checkForUpdates, runUpdates } from '../services/software-updater'
+import {
+  installPackageManager,
+  isSelfInstallableManager
+} from '../services/package-manager-install'
 import { trackMainWork } from '../services/main-work'
 import type { WindowGetter } from './index'
 import type {
+  ManagerInstallOutcome,
   UpdateCheckResult,
   UpdateProgress,
   UpdateRequestItem,
@@ -41,6 +46,18 @@ export function registerSoftwareUpdaterIpc(getWindow: WindowGetter): void {
         .map((it) => ({ id: it.id, source: it.source }))
       if (safeItems.length === 0) return { succeeded: 0, failed: 0, errors: [] }
       return trackMainWork(runUpdates(safeItems, sendProgress))
+    }
+  )
+
+  ipcMain.handle(
+    IPC.SOFTWARE_UPDATE_INSTALL_MANAGER,
+    async (_event, manager: unknown): Promise<ManagerInstallOutcome> => {
+      // Allow-list: the name selects one of Kudu's hard-coded vendor
+      // bootstraps, so anything else must never reach a shell.
+      if (!isSelfInstallableManager(manager)) {
+        return { success: false, command: '', error: 'Unsupported package manager' }
+      }
+      return trackMainWork(installPackageManager(manager))
     }
   )
 }

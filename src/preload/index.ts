@@ -630,6 +630,10 @@ const api = {
     ipcRenderer.invoke(IPC.SOFTWARE_UPDATE_CHECK),
   softwareUpdateRun: (items: UpdateRequestItem[]): Promise<UpdateResult> =>
     ipcRenderer.invoke(IPC.SOFTWARE_UPDATE_RUN, items),
+  softwareUpdateInstallManager: (
+    manager: import('../shared/types').WindowsPackageManager
+  ): Promise<import('../shared/types').ManagerInstallOutcome> =>
+    ipcRenderer.invoke(IPC.SOFTWARE_UPDATE_INSTALL_MANAGER, manager),
   onSoftwareUpdateProgress: (callback: (data: UpdateProgress) => void) => {
     const handler = (_event: Electron.IpcRendererEvent, data: UpdateProgress) => callback(data)
     ipcRenderer.on(IPC.SOFTWARE_UPDATE_PROGRESS, handler)

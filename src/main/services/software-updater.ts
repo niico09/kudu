@@ -1,5 +1,6 @@
 import { execFile } from 'child_process'
 import { existsSync, readdirSync } from 'fs'
+import { homedir } from 'os'
 import { join } from 'path'
 import { promisify } from 'util'
 import type {
@@ -16,6 +17,7 @@ import type {
 } from '../../shared/types'
 import { isAdmin } from './elevation'
 import { psUtf8 } from './exec-utf8'
+import { managerInstallCommand } from './package-manager-install'
 import { getSettings } from './settings-store'
 
 const execFileAsync = promisify(execFile)
@@ -428,6 +430,86 @@ export function resetWingetCache(): void {
   wingetExe = null
 }
 
+// ─── Manager CLI resolution (choco / scoop / npm) ───────────
+
+type ManagerCliName = 'choco' | 'scoop' | 'npm'
+
+/**
+ * Where each manager's own installer puts its CLI.
+ *
+ * An install writes PATH to the registry, so a process that was already running
+ * keeps the old value and cannot see the command — which is exactly the state
+ * Kudu is in right after installing a manager itself, or after the user
+ * installed one while Kudu was open. Falling back to the install location is
+ * what makes a fresh install usable without restarting the app.
+ */
+function managerPathCandidates(manager: ManagerCliName): string[] {
+  if (manager === 'choco') {
+    return [join(process.env.ProgramData || 'C:\\ProgramData', 'chocolatey', 'bin', 'choco.exe')]
+  }
+  if (manager === 'scoop') {
+    // The installer honours $env:SCOOP when the install was relocated.
+    return [join(process.env.SCOOP || join(homedir(), 'scoop'), 'shims', 'scoop.cmd')]
+  }
+  const candidates = [join(process.env.ProgramFiles || 'C:\\Program Files', 'nodejs', 'npm.cmd')]
+  // Global installs keep their own shim directory, which is also worth a look.
+  if (process.env.APPDATA) candidates.push(join(process.env.APPDATA, 'npm', 'npm.cmd'))
+  return candidates
+}
+
+const managerCliCache = new Map<ManagerCliName, string>()
+
+/** Exported for tests: forget every cached manager location. */
+export function resetManagerCliCache(): void {
+  managerCliCache.clear()
+}
+
+/**
+ * Find a working manager CLI: this process's PATH first, then the install
+ * location. Returns null when none of them respond. Mirrors `resolveWinget`.
+ */
+async function resolveManagerCli(manager: ManagerCliName): Promise<string | null> {
+  const cached = managerCliCache.get(manager)
+  if (cached) return cached
+  for (const candidate of [manager, ...managerPathCandidates(manager)]) {
+    if (await cliResponds(candidate, manager)) {
+      managerCliCache.set(manager, candidate)
+      return candidate
+    }
+  }
+  // A miss is deliberately not cached: a manager installed a moment later — by
+  // Kudu or by the user — has to be found on the very next scan. Mirrors
+  // `resolveWinget`, which also only remembers successes.
+  return null
+}
+
+/** Whether a CLI answers a version probe. */
+async function cliResponds(candidate: string, manager: ManagerCliName): Promise<boolean> {
+  try {
+    if (manager === 'choco') {
+      await execFileAsync(candidate, ['--version'], { timeout: 10_000, windowsHide: true })
+    } else {
+      await runShimCommand(candidate, ['--version'], 15_000)
+    }
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Run choco from wherever it actually lives, so a just-installed Chocolatey
+ * works in this process too.
+ */
+async function runChoco(args: string[], opts: { timeout?: number } = {}) {
+  const cli = (await resolveManagerCli('choco')) ?? 'choco'
+  return execFileAsync(cli, args, {
+    timeout: opts.timeout ?? 60_000,
+    maxBuffer: 10 * 1024 * 1024,
+    windowsHide: true
+  })
+}
+
 /**
  * winget exit codes that mean "nothing to report" rather than "something went
  * wrong". Node surfaces the HRESULT as an unsigned 32-bit exit code.
@@ -539,17 +621,35 @@ const ELEVATION_HINTS = [
   '0x80070005' // E_ACCESSDENIED
 ]
 
-/** Attempt a single winget upgrade and return {success, output} */
+/**
+ * Winget package id: alphanumeric first character (so an id can never be
+ * parsed as a flag such as `--source`), then dots, dashes, underscores and
+ * `+` — `Notepad++.Notepad++` is a real, widely installed winget package.
+ */
+const WINGET_ID_PATTERN = /^[\w][\w.+-]{0,200}$/
+
+/**
+ * Attempt a single winget upgrade and return {success, output}.
+ *
+ * The exit code decides success, not the console text: winget localises its
+ * output to the Windows display language, so the English patterns above only
+ * ever match an English UI — on every other locale a completed upgrade was
+ * reported as a failure. `execFile` rejects only on a non-zero exit (winget
+ * signals "nothing to do" with 0x8a150014/0x8a15002b), so a resolved call
+ * means the upgrade ran to completion.
+ */
 async function attemptWingetUpgrade(
   appId: string,
   extraArgs: string[] = []
-): Promise<{ success: boolean; output: string }> {
+): Promise<{ success: boolean; output: string; code?: number }> {
   // Validate appId format to prevent argument injection (e.g. --source flags)
-  if (!/^[\w][\w.\-]{0,200}$/.test(appId)) {
+  if (!WINGET_ID_PATTERN.test(appId)) {
     return { success: false, output: 'Invalid app ID format' }
   }
   const winget = (await resolveWinget()) ?? 'winget'
   let upgradeStdout = ''
+  let exitedCleanly = false
+  let exitCode: number | undefined
   try {
     const result = await execFileAsync(
       winget,
@@ -557,23 +657,27 @@ async function attemptWingetUpgrade(
       { timeout: 10 * 60 * 1000, maxBuffer: 10 * 1024 * 1024, windowsHide: true }
     )
     upgradeStdout = result.stdout
+    exitedCleanly = true
   } catch (err: any) {
+    // Node surfaces a Windows exit code as err.code; a spawn failure puts a
+    // string there (ENOENT) instead, so only a number is a real exit code.
+    if (typeof err?.code === 'number') exitCode = err.code
     if (err?.stdout) {
       upgradeStdout = err.stdout
     } else {
-      return { success: false, output: err?.message || 'Unknown error' }
+      return { success: false, output: err?.message || 'Unknown error', code: exitCode }
     }
   }
 
   const output = cleanOutput(upgradeStdout).toLowerCase()
-  const wasSuccessful = SUCCESS_PATTERNS.some((p) => output.includes(p))
+  const wasSuccessful = exitedCleanly || SUCCESS_PATTERNS.some((p) => output.includes(p))
   const hasClearFailure = FAILURE_PATTERNS.some((p) => output.includes(p))
 
   if (wasSuccessful && !hasClearFailure) {
     return { success: true, output: upgradeStdout }
   }
   // If no success pattern matched, treat as failure — don't assume success on ambiguous output
-  return { success: false, output: upgradeStdout }
+  return { success: false, output: upgradeStdout, code: exitCode }
 }
 
 /** Retry a failed upgrade with elevation using PowerShell Start-Process -Verb RunAs */
@@ -581,7 +685,7 @@ async function attemptElevatedUpgrade(
   appId: string
 ): Promise<{ success: boolean; output: string }> {
   // Validate appId format to prevent injection — winget IDs are alphanumeric with dots, dashes, underscores
-  if (!/^[\w][\w.\-]{0,200}$/.test(appId)) {
+  if (!WINGET_ID_PATTERN.test(appId)) {
     return { success: false, output: 'Invalid app ID format' }
   }
 
@@ -621,13 +725,52 @@ async function attemptElevatedUpgrade(
   }
 }
 
+/**
+ * Commands the user can run themselves when winget refuses an upgrade, keyed by
+ * the exit code it failed with. Each failure class needs a different remedy,
+ * and the code is the only signal that survives winget's localised output.
+ *
+ * `install --force` pushes the package's newest manifest over the existing
+ * install, which is what rescues the two "winget will not upgrade this" codes
+ * (verified against Anki.Anki and Gyan.FFmpeg). A changed installer technology
+ * cannot be crossed in place, so that one needs the uninstall first.
+ *
+ * Exported for tests.
+ */
+export function wingetRemedies(appId: string, code?: number): string[] {
+  const id = `"${appId}"`
+  switch (code === undefined ? 0 : code >>> 0) {
+    // "A newer version is available, but it does not apply to your system or
+    // requirements" / "No installed package found matching input criteria":
+    // winget's *upgrade* correlation is what failed, so install instead.
+    case 0x8a15002b: // APPINSTALLER_CLI_ERROR_UPDATE_NOT_APPLICABLE
+    case 0x8a150014: // APPINSTALLER_CLI_ERROR_NO_APPLICATIONS_FOUND
+      return [`winget install --id ${id} --exact --force`]
+    // "A newer version was found, but the install technology is different from
+    // the current version installed. Please uninstall the package and try
+    // installing the latest version."
+    case 0x8a15008e:
+      return [`winget uninstall --id ${id} --exact`, `winget install --id ${id} --exact`]
+    // Unknown failure: running it by hand shows the full, non-silent output.
+    default:
+      return [`winget upgrade --id ${id} --exact`]
+  }
+}
+
 /** Run a single app through the winget upgrade pipeline: normal → elevated → force */
 async function upgradeAppWinget(
   appId: string,
   alreadyAdmin: boolean
-): Promise<{ success: boolean; error?: string }> {
+): Promise<{ success: boolean; error?: string; suggestedCommands?: string[] }> {
+  // An id winget would read as a flag never reaches winget, so there is no
+  // command worth suggesting.
+  if (!WINGET_ID_PATTERN.test(appId)) {
+    return { success: false, error: 'Invalid app ID format' }
+  }
+
   // First attempt: normal upgrade
   let result = await attemptWingetUpgrade(appId)
+  let code = result.code
 
   // If failed and not already admin, retry with elevation
   if (!result.success && !alreadyAdmin) {
@@ -638,17 +781,20 @@ async function upgradeAppWinget(
 
     if (looksLikeElevationIssue) {
       result = await attemptElevatedUpgrade(appId)
+      // The elevated run reports through a separate re-check, so it has no exit
+      // code of its own — never suggest a remedy from a stale earlier one.
+      code = undefined
     }
   }
 
-  // If installer technology changed, skip retries — user must manually uninstall + reinstall
-  if (!result.success) {
-    const lowerOutput = cleanOutput(result.output).toLowerCase()
-    if (lowerOutput.includes('install technology is different')) {
-      return {
-        success: false,
-        error: 'Installer type changed — uninstall this app manually then install the new version'
-      }
+  // A changed installer technology cannot be crossed in place: winget refuses
+  // with 0x8a15008e and neither elevation nor --force can help, so skip the
+  // retries and hand the user the uninstall/install pair instead.
+  if (!result.success && code !== undefined && code >>> 0 === 0x8a15008e) {
+    return {
+      success: false,
+      error: lastOutputLine(result.output, 'Upgrade failed'),
+      suggestedCommands: wingetRemedies(appId, code)
     }
   }
 
@@ -656,14 +802,15 @@ async function upgradeAppWinget(
   if (!result.success) {
     const retryResult = await attemptWingetUpgrade(appId, ['--force'])
     if (retryResult.success) result = retryResult
+    else code = retryResult.code ?? code
   }
 
   if (result.success) return { success: true }
 
-  const lastLine = cleanOutput(result.output).trim().split('\n').pop() || 'Upgrade failed'
   return {
     success: false,
-    error: lastLine.length > 200 ? lastLine.slice(0, 200) + '...' : lastLine
+    error: lastOutputLine(result.output, 'Upgrade failed'),
+    suggestedCommands: wingetRemedies(appId, code)
   }
 }
 
@@ -673,15 +820,7 @@ async function upgradeAppWinget(
 const CHOCO_ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,200}$/
 
 async function isChocoAvailable(): Promise<boolean> {
-  try {
-    await execFileAsync('choco', ['--version'], {
-      timeout: 10_000,
-      windowsHide: true
-    })
-    return true
-  } catch {
-    return false
-  }
+  return (await resolveManagerCli('choco')) !== null
 }
 
 /**
@@ -739,11 +878,7 @@ async function checkForUpdatesChoco(): Promise<UpdateCheckResult> {
   try {
     let stdout = ''
     try {
-      const result = await execFileAsync('choco', ['outdated', '--limit-output'], {
-        timeout: 60_000,
-        maxBuffer: 10 * 1024 * 1024,
-        windowsHide: true
-      })
+      const result = await runChoco(['outdated', '--limit-output'])
       stdout = result.stdout
     } catch (err: any) {
       if (err?.stdout) {
@@ -760,11 +895,7 @@ async function checkForUpdatesChoco(): Promise<UpdateCheckResult> {
     try {
       let listStdout = ''
       try {
-        const listResult = await execFileAsync('choco', ['list', '--limit-output'], {
-          timeout: 60_000,
-          maxBuffer: 10 * 1024 * 1024,
-          windowsHide: true
-        })
+        const listResult = await runChoco(['list', '--limit-output'])
         listStdout = listResult.stdout
       } catch (err: any) {
         if (err?.stdout) listStdout = err.stdout
@@ -812,10 +943,8 @@ async function attemptChocoUpgrade(
   let upgradeStdout = ''
   try {
     // Note: no --limit-output here — verbose output is needed for success/failure pattern detection
-    const result = await execFileAsync('choco', ['upgrade', appId, '-y', ...extraArgs], {
-      timeout: 10 * 60 * 1000,
-      maxBuffer: 10 * 1024 * 1024,
-      windowsHide: true
+    const result = await runChoco(['upgrade', appId, '-y', ...extraArgs], {
+      timeout: 10 * 60 * 1000
     })
     upgradeStdout = result.stdout
   } catch (err: any) {
@@ -847,23 +976,22 @@ async function attemptElevatedChocoUpgrade(
   try {
     const args = ['upgrade', appId, '-y', '--force'].join(' ')
     const safeArgs = args.replace(/'/g, "''")
+    // Resolve the path here as well: the elevated process looks choco up in the
+    // same stale PATH, so a bare `choco` would fail right after installation.
+    const safeCli = ((await resolveManagerCli('choco')) ?? 'choco').replace(/'/g, "''")
     await execFileAsync(
       'powershell.exe',
       [
         '-NoProfile',
         '-Command',
         psUtf8(
-          `$p = Start-Process choco -ArgumentList '${safeArgs}' -Verb RunAs -Wait -PassThru -WindowStyle Hidden; exit $p.ExitCode`
+          `$p = Start-Process -FilePath '${safeCli}' -ArgumentList '${safeArgs}' -Verb RunAs -Wait -PassThru -WindowStyle Hidden; exit $p.ExitCode`
         )
       ],
       { timeout: 5 * 60 * 1000, maxBuffer: 10 * 1024 * 1024, windowsHide: true }
     )
     // Verify by checking if choco still lists this app as outdated
-    const checkResult = await execFileAsync('choco', ['outdated', '--limit-output'], {
-      timeout: 60_000,
-      maxBuffer: 10 * 1024 * 1024,
-      windowsHide: true
-    })
+    const checkResult = await runChoco(['outdated', '--limit-output'])
     const stillNeedsUpgrade = checkResult.stdout
       .split(/\r?\n/)
       .some((line) => line.startsWith(appId + '|'))
@@ -931,8 +1059,10 @@ async function upgradeAppChoco(
  * (app id) against the tool's id pattern first; shim ids contain no cmd.exe
  * metacharacters, so building the command line is safe.
  */
-async function runShim(tool: 'scoop' | 'npm', args: string[], timeout = 60_000): Promise<string> {
-  const cmdLine = `chcp 65001>nul && ${tool} ${args.join(' ')}`
+async function runShimCommand(command: string, args: string[], timeout: number): Promise<string> {
+  // The command is quoted because a resolved install path can contain spaces
+  // (`C:\Program Files\nodejs\npm.cmd`).
+  const cmdLine = `chcp 65001>nul && "${command}" ${args.join(' ')}`
   const { stdout } = await execFileAsync('cmd.exe', ['/d', '/v:off', '/s', '/c', cmdLine], {
     timeout,
     maxBuffer: 10 * 1024 * 1024,
@@ -940,6 +1070,12 @@ async function runShim(tool: 'scoop' | 'npm', args: string[], timeout = 60_000):
     windowsVerbatimArguments: true
   })
   return stdout
+}
+
+async function runShim(tool: 'scoop' | 'npm', args: string[], timeout = 60_000): Promise<string> {
+  const cli = await resolveManagerCli(tool)
+  if (!cli) throw new Error(`${tool} was not found`)
+  return runShimCommand(cli, args, timeout)
 }
 
 // ─── Scoop (Windows) ────────────────────────────────────────
@@ -1306,10 +1442,15 @@ async function checkForUpdatesWindows(): Promise<UpdateCheckResult> {
   const upToDate = results.flatMap((r) => r.upToDate)
   const managers: PackageManagerStatus[] = results.map((r, i) => {
     const error = r.managers[0]?.error
+    const name = enabled[i]
+    const installCommand = managerInstallCommand(name)
     return {
-      name: enabled[i],
+      name,
       available: r.packageManagerAvailable,
       outdatedCount: r.apps.length,
+      // Only worth sending when the manager is missing — otherwise it is just
+      // a command nobody needs.
+      ...(installCommand && !r.packageManagerAvailable ? { installCommand } : {}),
       ...(error ? { error } : {})
     }
   })
@@ -1332,7 +1473,7 @@ function upgradeWindowsApp(
   source: WindowsPackageManager,
   appId: string,
   alreadyAdmin: boolean
-): Promise<{ success: boolean; error?: string }> {
+): Promise<{ success: boolean; error?: string; suggestedCommands?: string[] }> {
   switch (source) {
     case 'winget':
       return upgradeAppWinget(appId, alreadyAdmin)
@@ -1371,6 +1512,30 @@ export function groupWindowsUpdateItems(
     groups.set(manager, list)
   }
   return groups
+}
+
+/**
+ * Fallback suggestion for a manager Kudu has no failure-class remedy for: the
+ * same upgrade, run by hand, where the real (non-silent) error is visible.
+ * winget is absent on purpose — its remedies come from `wingetRemedies`, and
+ * an id it refused outright has nothing worth suggesting.
+ *
+ * Exported for tests.
+ */
+export function manualRemedies(
+  manager: WindowsPackageManager,
+  appId: string
+): string[] | undefined {
+  switch (manager) {
+    case 'choco':
+      return [`choco upgrade ${appId} -y`]
+    case 'scoop':
+      return [`scoop update ${appId}`]
+    case 'npm':
+      return [`npm install -g ${appId}@latest`]
+    case 'winget':
+      return undefined
+  }
 }
 
 async function runUpdatesWindows(
@@ -1419,7 +1584,8 @@ async function runUpdatesWindows(
           appId,
           name: appId,
           reason: result.error || 'Upgrade failed',
-          source: origSource
+          source: origSource,
+          suggestedCommands: result.suggestedCommands ?? manualRemedies(manager, appId)
         })
         onProgress({
           phase: 'updating',
@@ -2098,9 +2264,6 @@ export async function runUpdates(
   return { succeeded: 0, failed: 0, errors: [] }
 }
 
-/** Winget package id: alphanumeric plus dot/dash/underscore */
-const WINGET_ID_PATTERN = /^[\w][\w.\-]{0,200}$/
-
 /** Validate an app ID for the current platform's package manager */
 export function isValidAppId(id: string): boolean {
   if (process.platform === 'darwin') return BREW_ID_PATTERN.test(id) && id.length <= 200
@@ -2110,8 +2273,8 @@ export function isValidAppId(id: string): boolean {
 
 /**
  * Validate an app ID against the pattern of the manager that owns it. Needed
- * for aggregation: npm scoped names (`@scope/pkg`) and Scoop names containing
- * `+` are valid for their manager but rejected by the winget/legacy pattern.
+ * for aggregation: npm scoped names (`@scope/pkg`) are valid for npm but
+ * rejected by the winget/legacy pattern.
  */
 export function isValidAppIdForSource(id: string, source: string): boolean {
   switch (source) {

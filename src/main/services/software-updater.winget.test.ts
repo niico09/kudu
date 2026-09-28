@@ -3,6 +3,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 // Regression tests for #462: the winget scan must never turn a failure (CLI
 // not found, timeout, crash) or a localised table into "everything is up to
 // date". Every scenario runs the real checkForUpdates() over a mocked winget.
+// The runUpdates() block at the end covers the upgrade path, which must decide
+// success from winget's exit code rather than its localised console text.
 
 const mockExecFile = vi.fn()
 vi.mock('child_process', async () => {
@@ -31,7 +33,13 @@ vi.mock('./settings-store', () => ({
   getSettings: () => ({ windowsPackageManagers: ['winget'] })
 }))
 
-import { checkForUpdates, resetWingetCache } from './software-updater'
+import {
+  checkForUpdates,
+  manualRemedies,
+  resetWingetCache,
+  runUpdates,
+  wingetRemedies
+} from './software-updater'
 
 type ExecCb = (err: unknown, stdout: string, stderr: string) => void
 
@@ -205,5 +213,156 @@ describe('checkForUpdates (winget)', () => {
     const result = await checkForUpdates()
     expect(result.apps).toHaveLength(2)
     expect(result.managers[0].error).toBeUndefined()
+  })
+})
+
+// ─── runUpdates: the upgrade path ───────────────────────────
+//
+// winget localises its console output to the Windows display language, so a
+// completed upgrade on a non-English Windows contains nothing an English
+// pattern can match. Only the exit code is language-independent.
+
+// Verbatim final line of a real upgrade on a Spanish Windows install.
+const LOCALISED_UPGRADE_SUCCESS = 'Instalado correctamente\r\n'
+const LOCALISED_NO_APPLICABLE =
+  'No se encontró ningún paquete que coincida con los criterios de entrada.\r\n'
+// Verbatim winget message for a package whose installer technology changed.
+const LOCALISED_TECH_CHANGED =
+  'Se encontró una versión más reciente, pero la tecnología de instalación es diferente de la versión actual instalada. Desinstale el paquete e instale la versión más reciente.\r\n'
+
+describe('runUpdates (winget)', () => {
+  it('reports a localised upgrade as success when winget exits 0', async () => {
+    scriptWinget({
+      '--version': { stdout: 'v1.29.380' },
+      upgrade: { stdout: LOCALISED_UPGRADE_SUCCESS }
+    })
+
+    const result = await runUpdates([{ id: 'Stockfish.Stockfish', source: 'winget' }], () => {})
+
+    expect(result.succeeded).toBe(1)
+    expect(result.failed).toBe(0)
+    expect(result.errors).toEqual([])
+  })
+
+  it('attempts ids containing + instead of rejecting them as malformed', async () => {
+    const upgradeArgs: string[][] = []
+    mockExecFile.mockImplementation((file: string, args: string[], _o: unknown, cb: ExecCb) => {
+      if (args[0] === 'upgrade') upgradeArgs.push(args)
+      cb(null, args[0] === '--version' ? 'v1.29.380' : LOCALISED_UPGRADE_SUCCESS, '')
+    })
+
+    const result = await runUpdates([{ id: 'Notepad++.Notepad++', source: 'winget' }], () => {})
+
+    expect(result.succeeded).toBe(1)
+    expect(result.errors).toEqual([])
+    expect(upgradeArgs[0]).toContain('Notepad++.Notepad++')
+  })
+
+  it('still reports a failure when winget exits non-zero', async () => {
+    scriptWinget({
+      '--version': { stdout: 'v1.29.380' },
+      upgrade: { stdout: LOCALISED_NO_APPLICABLE, error: { code: 0x8a15002b } }
+    })
+
+    const result = await runUpdates([{ id: 'Anki.Anki', source: 'winget' }], () => {})
+
+    expect(result.succeeded).toBe(0)
+    expect(result.failed).toBe(1)
+    expect(result.errors[0]).toMatchObject({ appId: 'Anki.Anki', source: 'winget' })
+  })
+
+  it('refuses ids that would be parsed as a flag, without invoking winget', async () => {
+    const calls: string[] = []
+    mockExecFile.mockImplementation((file: string, args: string[], _o: unknown, cb: ExecCb) => {
+      calls.push(args[0])
+      cb(null, 'v1.29.380', '')
+    })
+
+    const result = await runUpdates([{ id: '--source', source: 'winget' }], () => {})
+
+    expect(result.failed).toBe(1)
+    expect(result.errors[0].reason).toBe('Invalid app ID format')
+    // Nothing reached winget, so there is no command to suggest
+    expect(result.errors[0].suggestedCommands).toBeUndefined()
+    expect(calls).not.toContain('upgrade')
+  })
+
+  it('suggests the remedy matching the exit code that failed', async () => {
+    scriptWinget({
+      '--version': { stdout: 'v1.29.380' },
+      upgrade: { stdout: LOCALISED_NO_APPLICABLE, error: { code: 0x8a15002b } }
+    })
+
+    const result = await runUpdates([{ id: 'Docker.DockerDesktop', source: 'winget' }], () => {})
+
+    expect(result.errors[0].suggestedCommands).toEqual([
+      'winget install --id "Docker.DockerDesktop" --exact --force'
+    ])
+  })
+
+  it('skips the --force retry when the installer technology changed', async () => {
+    const upgrades: string[][] = []
+    mockExecFile.mockImplementation((file: string, args: string[], _o: unknown, cb: ExecCb) => {
+      if (args[0] !== 'upgrade') {
+        cb(null, 'v1.29.380', '')
+        return
+      }
+      upgrades.push(args)
+      cb(
+        Object.assign(new Error('failed'), {
+          code: 0x8a15008e,
+          stdout: LOCALISED_TECH_CHANGED
+        }),
+        LOCALISED_TECH_CHANGED,
+        ''
+      )
+    })
+
+    const result = await runUpdates([{ id: 'LLVM.LLVM', source: 'winget' }], () => {})
+
+    // Neither elevation nor --force can cross an installer-technology change
+    expect(upgrades).toHaveLength(1)
+    expect(result.errors[0].suggestedCommands).toEqual([
+      'winget uninstall --id "LLVM.LLVM" --exact',
+      'winget install --id "LLVM.LLVM" --exact'
+    ])
+  })
+})
+
+// ─── Suggested commands ─────────────────────────────────────
+
+describe('wingetRemedies', () => {
+  it('suggests install --force for packages winget refuses to upgrade', () => {
+    // 0x8a15002b — "a newer version is available but does not apply" (Anki)
+    expect(wingetRemedies('Anki.Anki', 0x8a15002b)).toEqual([
+      'winget install --id "Anki.Anki" --exact --force'
+    ])
+    // 0x8a150014 — the id matched no installed package (FFmpeg)
+    expect(wingetRemedies('Gyan.FFmpeg', 0x8a150014)).toEqual([
+      'winget install --id "Gyan.FFmpeg" --exact --force'
+    ])
+  })
+
+  it('suggests uninstall + install when the installer technology changed', () => {
+    expect(wingetRemedies('LLVM.LLVM', 0x8a15008e)).toEqual([
+      'winget uninstall --id "LLVM.LLVM" --exact',
+      'winget install --id "LLVM.LLVM" --exact'
+    ])
+  })
+
+  it('falls back to the same upgrade run by hand when the code is unknown', () => {
+    expect(wingetRemedies('Foo.Bar')).toEqual(['winget upgrade --id "Foo.Bar" --exact'])
+  })
+})
+
+describe('manualRemedies', () => {
+  it('names the owning manager command', () => {
+    expect(manualRemedies('choco', 'git')).toEqual(['choco upgrade git -y'])
+    expect(manualRemedies('scoop', '7zip')).toEqual(['scoop update 7zip'])
+    expect(manualRemedies('npm', '@angular/cli')).toEqual(['npm install -g @angular/cli@latest'])
+  })
+
+  it('leaves winget to wingetRemedies', () => {
+    expect(manualRemedies('winget', 'Anki.Anki')).toBeUndefined()
   })
 })

@@ -65,6 +65,15 @@
     "updateResultAppsUpdated": "{{count}} aplicación actualizada correctamente",
     "updateResultAppsUpdatedPlural": "{{count}} aplicaciones actualizadas correctamente",
     "updateResultFailed": "{{count}} con error",
+    "suggestedCommandsLabel": "Ejecute esto manualmente:",
+    "installManager": {
+      "missing": "{{manager}} está activado, pero no está instalado.",
+      "install": "Instalar {{manager}}",
+      "installing": "Instalando...",
+      "commandLabel": "O ejecútelo usted mismo en PowerShell:",
+      "success": "{{manager}} se instaló correctamente.",
+      "failed": "No se pudo instalar {{manager}}: {{error}}"
+    },
     "deselectAll": "Deseleccionar todo",
     "selectAll": "Seleccionar todo",
     "selectedCount": "{{count}} seleccionadas",

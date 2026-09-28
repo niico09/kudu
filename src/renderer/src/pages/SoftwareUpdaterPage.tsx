@@ -28,6 +28,8 @@ import { useHistoryStore } from '@/stores/history-store'
 import { useSettingsStore } from '@/stores/settings-store'
 import { usePlatform } from '@/hooks/usePlatform'
 import type {
+  ManagerInstallOutcome,
+  PackageManagerStatus,
   UpdateProgress,
   UpdatableApp,
   UpToDateApp,
@@ -105,6 +107,35 @@ export function SoftwareUpdaterPage({ embedded }: { embedded?: boolean }) {
   const ignoredApps = useUpdaterStore((s) => s.ignoredApps)
 
   const { platform } = usePlatform()
+
+  const [installingManager, setInstallingManager] = useState<WindowsPackageManager | null>(null)
+  const [managerInstall, setManagerInstall] = useState<{
+    manager: WindowsPackageManager
+    outcome: ManagerInstallOutcome
+  } | null>(null)
+
+  // Enabled managers Kudu cannot find but knows how to install. The main
+  // process only sends `installCommand` for those, so this list drives both the
+  // offer to install and the command shown next to it.
+  const missingManagers = useMemo(
+    () =>
+      !hasChecked
+        ? []
+        : managers.filter(
+            (
+              m
+            ): m is PackageManagerStatus & {
+              name: WindowsPackageManager
+              installCommand: string
+            } =>
+              // Only Windows managers have an installer here, and only the two
+              // with a vendor bootstrap carry `installCommand`.
+              WINDOWS_MANAGER_OPTIONS.some((o) => o.id === m.name) &&
+              !m.available &&
+              !!m.installCommand
+          ),
+    [hasChecked, managers]
+  )
   const windowsPackageManagers = useSettingsStore((s) => s.settings.windowsPackageManagers)
   const enabledManagers = windowsPackageManagers ?? DEFAULT_WINDOWS_MANAGERS
   // Managers that were scanned but never produced a package list (CLI
@@ -305,6 +336,33 @@ export function SoftwareUpdaterPage({ embedded }: { embedded?: boolean }) {
     [handleCheck]
   )
 
+  // ─── Install a manager Kudu cannot find ─────────────────────
+  const handleInstallManager = useCallback(
+    async (manager: WindowsPackageManager) => {
+      const label = WINDOWS_MANAGER_OPTIONS.find((o) => o.id === manager)?.label ?? manager
+      setInstallingManager(manager)
+      setManagerInstall(null)
+      try {
+        const outcome = await window.kudu.softwareUpdateInstallManager(manager)
+        setManagerInstall({ manager, outcome })
+        if (outcome.success) {
+          toast.success(t('softwareUpdater.installManager.success', { manager: label }))
+          // Re-scan: that is what makes the new manager light up and the
+          // banner disappear.
+          await handleCheck()
+        }
+      } catch {
+        setManagerInstall({
+          manager,
+          outcome: { success: false, command: '', error: 'unexpected error' }
+        })
+      } finally {
+        setInstallingManager(null)
+      }
+    },
+    [handleCheck, t]
+  )
+
   // ─── Filtered & sorted list ─────────────────────────────────
   const filteredApps = useMemo(() => {
     let list = apps
@@ -415,6 +473,77 @@ export function SoftwareUpdaterPage({ embedded }: { embedded?: boolean }) {
             })}
           </div>
         )}
+
+        {/* Managers Kudu cannot find — install them, or hand over the command */}
+        {platform === 'win32' &&
+          missingManagers.map((m) => {
+            const label = WINDOWS_MANAGER_OPTIONS.find((o) => o.id === m.name)?.label ?? m.name
+            const installing = installingManager === m.name
+            const result = managerInstall?.manager === m.name ? managerInstall.outcome : null
+            return (
+              <div
+                key={m.name}
+                className="mb-5 rounded-2xl px-5 py-4"
+                style={{
+                  background: 'rgba(234,179,8,0.04)',
+                  border: '1px solid rgba(234,179,8,0.14)'
+                }}
+              >
+                <div className="flex items-center gap-3">
+                  <AlertTriangle className="h-5 w-5 shrink-0 text-amber-400" strokeWidth={1.8} />
+                  <p className="text-[12px] text-zinc-400">
+                    {t('softwareUpdater.installManager.missing', { manager: label })}
+                  </p>
+                  <button
+                    onClick={() => handleInstallManager(m.name)}
+                    disabled={installing || isBusy}
+                    className="ml-auto flex shrink-0 items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-[12px] font-medium transition-all disabled:opacity-40"
+                    style={{ background: 'var(--accent-muted-bg)', color: 'var(--accent)' }}
+                  >
+                    {installing ? (
+                      <Loader2 className="h-3 w-3 animate-spin" />
+                    ) : (
+                      <Download className="h-3 w-3" strokeWidth={2} />
+                    )}
+                    {installing
+                      ? t('softwareUpdater.installManager.installing')
+                      : t('softwareUpdater.installManager.install', { manager: label })}
+                  </button>
+                </div>
+
+                <div className="mt-2.5 text-[11px]" style={{ color: 'var(--text-muted)' }}>
+                  {t('softwareUpdater.installManager.commandLabel')}
+                </div>
+                <div
+                  className="mt-1.5 cursor-text rounded-lg px-3 py-2 font-mono text-[11px] break-all text-zinc-300 select-all"
+                  style={{
+                    background: 'rgba(0,0,0,0.3)',
+                    border: '1px solid var(--border-medium)'
+                  }}
+                >
+                  {m.installCommand}
+                </div>
+
+                {result && !result.success && result.error && (
+                  <div className="mt-1.5 flex items-start gap-1.5 text-[11px] text-red-400">
+                    <XCircle className="mt-0.5 h-3 w-3 shrink-0" strokeWidth={2} />
+                    <span>
+                      {t('softwareUpdater.installManager.failed', {
+                        manager: label,
+                        error: result.error
+                      })}
+                    </span>
+                  </div>
+                )}
+                {result?.success && (
+                  <div className="mt-1.5 flex items-start gap-1.5 text-[11px] text-emerald-400">
+                    <CheckCircle2 className="mt-0.5 h-3 w-3 shrink-0" strokeWidth={2} />
+                    <span>{t('softwareUpdater.installManager.success', { manager: label })}</span>
+                  </div>
+                )}
+              </div>
+            )
+          })}
 
         {/* Search */}
         {hasChecked && apps.length > 0 && (
@@ -758,25 +887,28 @@ export function SoftwareUpdaterPage({ embedded }: { embedded?: boolean }) {
             {updateResult.errors.length > 0 && (
               <div className="mt-2">
                 {updateResult.errors.map((e) => {
-                  const isInstallerChange = e.reason
-                    .toLowerCase()
-                    .includes('installer type changed')
+                  const commands = e.suggestedCommands ?? []
                   return (
                     <div key={e.appId} className="mt-1.5">
                       <span style={{ color: 'var(--text-muted)' }} className="text-[12px]">
                         {e.name}: {e.reason}
                       </span>
-                      {isInstallerChange && packageManagerName && (
-                        <div
-                          className="mt-1.5 rounded-lg px-3 py-2 font-mono text-[11px] text-zinc-300 select-all cursor-text"
-                          style={{
-                            background: 'rgba(0,0,0,0.3)',
-                            border: '1px solid var(--border-medium)'
-                          }}
-                        >
-                          {packageManagerName} uninstall {e.appId}
-                          <br />
-                          {packageManagerName} install {e.appId}
+                      {commands.length > 0 && (
+                        <div className="mt-1.5">
+                          <div style={{ color: 'var(--text-muted)' }} className="mb-1 text-[11px]">
+                            {t('softwareUpdater.suggestedCommandsLabel')}
+                          </div>
+                          <div
+                            className="rounded-lg px-3 py-2 font-mono text-[11px] text-zinc-300 select-all cursor-text"
+                            style={{
+                              background: 'rgba(0,0,0,0.3)',
+                              border: '1px solid var(--border-medium)'
+                            }}
+                          >
+                            {commands.map((command) => (
+                              <div key={command}>{command}</div>
+                            ))}
+                          </div>
                         </div>
                       )}
                     </div>

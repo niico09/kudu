@@ -65,6 +65,15 @@
     "updateResultAppsUpdated": "{{count}} app updated successfully",
     "updateResultAppsUpdatedPlural": "{{count}} apps updated successfully",
     "updateResultFailed": "{{count}} failed",
+    "suggestedCommandsLabel": "Try running this yourself:",
+    "installManager": {
+      "missing": "{{manager}} is enabled but not installed.",
+      "install": "Install {{manager}}",
+      "installing": "Installing...",
+      "commandLabel": "Or run this yourself in PowerShell:",
+      "success": "{{manager}} installed.",
+      "failed": "Could not install {{manager}}: {{error}}"
+    },
     "deselectAll": "Deselect all",
     "selectAll": "Select all",
     "selectedCount": "{{count}} selected",
